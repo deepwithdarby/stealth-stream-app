@@ -1,7 +1,6 @@
 import CryptoJS from 'crypto-js';
 import { FFmpeg } from '@ffmpeg/ffmpeg';
 import { fetchFile, toBlobURL } from '@ffmpeg/util';
-import { createFFmpeg, fetchFile } from '@ffmpeg/ffmpeg';
 
 // ---------- Helpers used by both classes ----------
 function seededPRNG(seed: string) {
