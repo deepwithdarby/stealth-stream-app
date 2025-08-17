@@ -1,7 +1,94 @@
 import CryptoJS from 'crypto-js';
 import { FFmpeg } from '@ffmpeg/ffmpeg';
 import { fetchFile, toBlobURL } from '@ffmpeg/util';
+import { createFFmpeg, fetchFile } from '@ffmpeg/ffmpeg';
 
+// ---------- Helpers used by both classes ----------
+function seededPRNG(seed: string) {
+  let state = 0;
+  for (let i = 0; i < seed.length; i++) {
+    state = (state * 31 + seed.charCodeAt(i)) >>> 0;
+  }
+  return () => {
+    state = (state * 1664525 + 1013904223) >>> 0;
+    return state / 0x100000000;
+  };
+}
+
+// Partial Fisher-Yates to get `needed` unique indices (deterministic given prng)
+function generateIndicesPRNG(prng: () => number, length: number, needed: number): number[] {
+  if (needed > length) throw new Error('needed > length');
+  const arr = new Uint32Array(length);
+  for (let i = 0; i < length; i++) arr[i] = i;
+  // Shuffle only enough elements so the last `needed` entries are randomized
+  for (let i = length - 1; i >= length - needed; i--) {
+    const j = Math.floor(prng() * (i + 1));
+    const tmp = arr[i];
+    arr[i] = arr[j];
+    arr[j] = tmp;
+  }
+  // return the last `needed` elements
+  return Array.from(arr.slice(length - needed));
+}
+
+function bytesToBitString(bytes: Uint8Array): string {
+  let s = '';
+  for (let b of bytes) s += b.toString(2).padStart(8, '0');
+  return s;
+}
+function bitStringToBytes(bits: string): Uint8Array {
+  const n = Math.floor(bits.length / 8);
+  const out = new Uint8Array(n);
+  for (let i = 0; i < n; i++) {
+    out[i] = parseInt(bits.substr(i * 8, 8), 2);
+  }
+  return out;
+}
+
+function decodeRedundantBits(redundantBits: string): string {
+  let decoded = '';
+  for (let i = 0; i < redundantBits.length; i += 3) {
+    const triplet = redundantBits.substr(i, 3);
+    if (triplet.length < 3) break;
+    const ones = (triplet.match(/1/g) || []).length;
+    decoded += ones >= 2 ? '1' : '0';
+  }
+  return decoded;
+}
+
+// Convert AudioBuffer -> Int16Array (mono: first channel)
+function audioBufferToInt16Array(buffer: AudioBuffer): Int16Array {
+  const samples = buffer.getChannelData(0);
+  const int16 = new Int16Array(samples.length);
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    int16[i] = s < 0 ? Math.round(s * 0x8000) : Math.round(s * 0x7fff);
+  }
+  return int16;
+}
+function int16ArrayToWav(samples: Int16Array, sampleRate: number): ArrayBuffer {
+  const length = samples.length;
+  const buffer = new ArrayBuffer(44 + length * 2);
+  const view = new DataView(buffer);
+  const writeString = (offset: number, str: string) => {
+    for (let i = 0; i < str.length; i++) view.setUint8(offset + i, str.charCodeAt(i));
+  };
+  writeString(0, 'RIFF');
+  view.setUint32(4, 36 + length * 2, true);
+  writeString(8, 'WAVE');
+  writeString(12, 'fmt ');
+  view.setUint32(16, 16, true);
+  view.setUint16(20, 1, true);
+  view.setUint16(22, 1, true);
+  view.setUint32(24, sampleRate, true);
+  view.setUint32(28, sampleRate * 2, true);
+  view.setUint16(32, 2, true);
+  view.setUint16(34, 16, true);
+  writeString(36, 'data');
+  view.setUint32(40, length * 2, true);
+  for (let i = 0; i < length; i++) view.setInt16(44 + i * 2, samples[i], true);
+  return buffer;
+}
 // Text Steganography using zero-width characters
 export class TextSteganography {
   private static readonly ZERO_WIDTH_SPACE = '\u200B';
@@ -220,181 +307,105 @@ export class ImageSteganography {
   }
 }
 
-// Audio Steganography using LSB on PCM data
+// ---------- AudioSteganography (corrected) ----------
 export class AudioSteganography {
-  private static ffmpeg: FFmpeg | null = null;
+  private static ffmpeg: ReturnType<typeof createFFmpeg> | null = null;
 
-  private static async initFFmpeg(): Promise<FFmpeg> {
+  // Embedding parameters (keep similar to your original)
+  private static redundancy = 3; // triple redundancy
+  private static embeddingFraction = 0.8; // fraction of samples considered for embedding
+
+  private static async initFFmpeg(): Promise<ReturnType<typeof createFFmpeg>> {
     if (!this.ffmpeg) {
-      this.ffmpeg = new FFmpeg();
-      
-      const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd';
-      await this.ffmpeg.load({
-        coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
-        wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
-      });
+      this.ffmpeg = createFFmpeg({ log: false });
+      await this.ffmpeg.load();
     }
     return this.ffmpeg;
   }
 
-  private static async deriveKeyFromPassword(password: string): Promise<{ salt: Uint8Array, key: CryptoKey }> {
-    const salt = crypto.getRandomValues(new Uint8Array(16));
-    // For demo purposes, using a simplified key derivation
-    const keyMaterial = new TextEncoder().encode(password + salt.join(''));
-    const key = await crypto.subtle.importKey('raw', keyMaterial.slice(0, 32), 'AES-GCM', false, ['encrypt', 'decrypt']);
-    return { salt, key };
-  }
-
-  private static seededPRNG(seed: string) {
-    let state = 0;
-    for (let i = 0; i < seed.length; i++) {
-      state = (state * 31 + seed.charCodeAt(i)) >>> 0;
-    }
-    
-    return () => {
-      state = (state * 1664525 + 1013904223) >>> 0;
-      return state / 0x100000000;
-    };
-  }
-
   private static async fileToAudioBuffer(file: File): Promise<{ buffer: AudioBuffer, originalFormat: string }> {
     const arrayBuffer = await file.arrayBuffer();
-    
     try {
-      // Try direct audio decoding first
       const audioContext = new AudioContext();
-      const buffer = await audioContext.decodeAudioData(arrayBuffer.slice());
+      const buffer = await audioContext.decodeAudioData(arrayBuffer.slice(0));
       audioContext.close();
       return { buffer, originalFormat: file.type };
     } catch {
-      // Fallback to FFmpeg for unsupported formats
       const ffmpeg = await this.initFFmpeg();
       const inputName = `input.${file.name.split('.').pop()}`;
-      const outputName = 'output.wav';
-      
-      await ffmpeg.writeFile(inputName, new Uint8Array(arrayBuffer));
-      await ffmpeg.exec(['-i', inputName, '-f', 'wav', '-ac', '1', '-ar', '44100', outputName]);
-      
-      const wavData = await ffmpeg.readFile(outputName) as Uint8Array;
-      const wavBuffer = new ArrayBuffer(wavData.length);
-      new Uint8Array(wavBuffer).set(wavData);
-      
+      await ffmpeg.FS('writeFile', inputName, await fetchFile(file));
+      await ffmpeg.run('-i', inputName, '-f', 'wav', '-ac', '1', '-ar', '44100', 'output.wav');
+      const wavData = ffmpeg.FS('readFile', 'output.wav') as Uint8Array;
+      const wavBuffer = wavData.buffer.slice(0);
       const audioContext = new AudioContext();
       const buffer = await audioContext.decodeAudioData(wavBuffer);
       audioContext.close();
-      
       return { buffer, originalFormat: 'converted' };
     }
   }
 
-  private static audioBufferToInt16Array(buffer: AudioBuffer): Int16Array {
-    const samples = buffer.getChannelData(0); // Use first channel
-    const int16Samples = new Int16Array(samples.length);
-    
-    for (let i = 0; i < samples.length; i++) {
-      const sample = Math.max(-1, Math.min(1, samples[i]));
-      int16Samples[i] = sample < 0 ? sample * 0x8000 : sample * 0x7FFF;
-    }
-    
-    return int16Samples;
+  static async calculateCapacity(file: File): Promise<number> {
+    const { buffer } = await this.fileToAudioBuffer(file);
+    const samples = this.audioBufferToInt16Array(buffer);
+    // capacity bits available for LSB embedding (we use embeddingFraction of samples)
+    const capacityBits = Math.floor(samples.length * this.embeddingFraction);
+    // account for redundancy
+    const payloadBits = Math.floor(capacityBits / this.redundancy);
+    const payloadBytes = Math.floor(payloadBits / 8);
+    // subtract header (magic 7 bytes + 4 bytes length)
+    return Math.max(0, payloadBytes - (7 + 4));
   }
 
-  private static int16ArrayToWav(samples: Int16Array, sampleRate: number): ArrayBuffer {
-    const length = samples.length;
-    const buffer = new ArrayBuffer(44 + length * 2);
-    const view = new DataView(buffer);
-    
-    // WAV header
-    const writeString = (offset: number, string: string) => {
-      for (let i = 0; i < string.length; i++) {
-        view.setUint8(offset + i, string.charCodeAt(i));
-      }
-    };
-    
-    writeString(0, 'RIFF');
-    view.setUint32(4, 36 + length * 2, true);
-    writeString(8, 'WAVE');
-    writeString(12, 'fmt ');
-    view.setUint32(16, 16, true);
-    view.setUint16(20, 1, true);
-    view.setUint16(22, 1, true);
-    view.setUint32(24, sampleRate, true);
-    view.setUint32(28, sampleRate * 2, true);
-    view.setUint16(32, 2, true);
-    view.setUint16(34, 16, true);
-    writeString(36, 'data');
-    view.setUint32(40, length * 2, true);
-    
-    // PCM data
-    for (let i = 0; i < length; i++) {
-      view.setInt16(44 + i * 2, samples[i], true);
-    }
-    
-    return buffer;
+  private static audioBufferToInt16Array(buffer: AudioBuffer) {
+    return audioBufferToInt16Array(buffer);
   }
 
   static async encode(file: File, secretMessage: string, password?: string): Promise<Blob> {
     const { buffer } = await this.fileToAudioBuffer(file);
     const samples = this.audioBufferToInt16Array(buffer);
-    
+
+    // Preserve user flow: if password provided, use CryptoJS.AES.encrypt (keeps your earlier logic)
     let messageToEncode = secretMessage;
-    
-    // Encrypt if password provided
     if (password) {
       messageToEncode = CryptoJS.AES.encrypt(secretMessage, password).toString();
     }
 
-    // Convert message to binary with header
-    const messageBinary = messageToEncode
-      .split('')
-      .map(char => char.charCodeAt(0).toString(2).padStart(8, '0'))
-      .join('');
-    
-    const header = 'USTEGA1';
-    const headerBinary = header
-      .split('')
-      .map(char => char.charCodeAt(0).toString(2).padStart(8, '0'))
-      .join('');
-    
-    const endMarker = '1111111111111110';
-    const fullBinary = headerBinary + messageBinary + endMarker;
-    
-    // Apply 3x redundancy
+    // Build header: MAGIC + 32-bit length + message
+    const header = 'USTEGA1'; // 7 bytes
+    const headerBytes = new Uint8Array(header.split('').map(c => c.charCodeAt(0)));
+    const msgBytes = new TextEncoder().encode(messageToEncode);
+    const len = msgBytes.length;
+    const lenBinary = len.toString(2).padStart(32, '0');
+    const headerBinary = bytesToBitString(headerBytes);
+    const messageBinary = bytesToBitString(msgBytes);
+    const fullBinary = headerBinary + lenBinary + messageBinary;
+
+    // 3x redundancy
     const redundantBinary = fullBinary.split('').flatMap(bit => [bit, bit, bit]).join('');
-    
-    // Check capacity
-    const capacity = Math.floor(samples.length * 0.8); // Use 80% of samples for safety
-    if (redundantBinary.length > capacity) {
+
+    // capacity check (bits)
+    const capacityBits = Math.floor(samples.length * this.embeddingFraction);
+    if (redundantBinary.length > capacityBits) {
       throw new Error('Message too large for this audio file');
     }
 
-    // Generate PRNG for sample indices
+    // PRNG seed: keep using CryptoJS.SHA256(password).toString() if password else default
     const seed = password ? CryptoJS.SHA256(password).toString() : 'default-seed';
-    const prng = this.seededPRNG(seed);
-    
-    // Create permutation of sample indices
-    const indices: number[] = [];
-    const used = new Set<number>();
-    
-    for (let i = 0; i < redundantBinary.length; i++) {
-      let idx;
-      do {
-        idx = Math.floor(prng() * samples.length);
-      } while (used.has(idx));
-      used.add(idx);
-      indices.push(idx);
-    }
+    const prng = seededPRNG(seed);
 
-    // Embed bits in LSB
-    const modifiedSamples = new Int16Array(samples);
+    // Generate deterministic unique indices (fast)
+    const indices = generateIndicesPRNG(prng, samples.length, redundantBinary.length);
+
+    // Embed bits into LSB of samples
+    const modifiedSamples = new Int16Array(samples); // copy
     for (let i = 0; i < redundantBinary.length; i++) {
       const sampleIndex = indices[i];
-      const bit = parseInt(redundantBinary[i]);
+      const bit = parseInt(redundantBinary[i], 10);
       modifiedSamples[sampleIndex] = (modifiedSamples[sampleIndex] & 0xFFFE) | bit;
     }
 
-    // Export as WAV
-    const wavBuffer = this.int16ArrayToWav(modifiedSamples, buffer.sampleRate);
+    // Export as WAV (preserve sampleRate)
+    const wavBuffer = int16ArrayToWav(modifiedSamples, buffer.sampleRate);
     return new Blob([wavBuffer], { type: 'audio/wav' });
   }
 
@@ -402,74 +413,63 @@ export class AudioSteganography {
     try {
       const { buffer } = await this.fileToAudioBuffer(file);
       const samples = this.audioBufferToInt16Array(buffer);
-      
-      // Generate same PRNG sequence
+
       const seed = password ? CryptoJS.SHA256(password).toString() : 'default-seed';
-      const prng = this.seededPRNG(seed);
-      
-      // Extract bits using same index pattern
-      let extractedBits = '';
-      const used = new Set<number>();
-      
-      // Extract more bits than minimum to find the end marker
-      const maxBits = Math.min(10000, Math.floor(samples.length * 0.8));
-      
-      for (let i = 0; i < maxBits; i++) {
-        let idx;
-        do {
-          idx = Math.floor(prng() * samples.length);
-        } while (used.has(idx));
-        used.add(idx);
-        
-        const bit = samples[idx] & 1;
-        extractedBits += bit;
-        
-        // Check for end marker in the redundant stream
-        if (extractedBits.length >= 48) { // Header + some data minimum
-          const decoded = this.decodeRedundantBits(extractedBits);
-          if (decoded && decoded.includes('1111111111111110')) {
-            extractedBits = decoded;
-            break;
+      const prng = seededPRNG(seed);
+
+      // We'll read as many bits as encoder could have used (capacityBits)
+      const capacityBits = Math.floor(samples.length * this.embeddingFraction);
+      const indices = generateIndicesPRNG(prng, samples.length, capacityBits);
+
+      // Read redundant bit stream in same order
+      let redundantStream = '';
+      for (let i = 0; i < indices.length; i++) {
+        redundantStream += (samples[indices[i]] & 1).toString();
+        // If we already have enough redundant bits to decode header + length (7 bytes + 32 bits) after majority,
+        // try to decode early to stop sooner.
+        const minRedundantNeeded = (7 * 8 + 32) * this.redundancy;
+        if (redundantStream.length >= minRedundantNeeded) {
+          const decodedSoFar = decodeRedundantBits(redundantStream);
+          const headerBinary = bytesToBitString(new Uint8Array('USTEGA1'.split('').map(c => c.charCodeAt(0))));
+          const headerIndex = decodedSoFar.indexOf(headerBinary);
+          if (headerIndex !== -1 && decodedSoFar.length >= headerIndex + headerBinary.length + 32) {
+            // read 32-bit len
+            const lenBits = decodedSoFar.substr(headerIndex + headerBinary.length, 32);
+            const msgLen = parseInt(lenBits, 2);
+            const totalMsgBits = msgLen * 8;
+            // check if we have full message bits already
+            if (decodedSoFar.length >= headerIndex + headerBinary.length + 32 + totalMsgBits) {
+              const messageBits = decodedSoFar.substr(headerIndex + headerBinary.length + 32, totalMsgBits);
+              const msgBytes = bitStringToBytes(messageBits);
+              const decodedMessage = new TextDecoder().decode(msgBytes);
+              // decrypt if password
+              if (password) {
+                try {
+                  const decryptedBytes = CryptoJS.AES.decrypt(decodedMessage, password);
+                  const decryptedMessage = decryptedBytes.toString(CryptoJS.enc.Utf8);
+                  return decryptedMessage || null;
+                } catch {
+                  return null;
+                }
+              }
+              return decodedMessage;
+            }
           }
         }
       }
-      
-      // Decode redundancy (majority vote)
-      if (extractedBits.length < 48) {
-        extractedBits = this.decodeRedundantBits(extractedBits);
-      }
-      
-      // Find header
-      const headerBinary = 'USTEGA1'
-        .split('')
-        .map(char => char.charCodeAt(0).toString(2).padStart(8, '0'))
-        .join('');
-      
-      const headerIndex = extractedBits.indexOf(headerBinary);
-      if (headerIndex === -1) {
-        return null;
-      }
-      
-      // Find end marker
-      const endMarker = '1111111111111110';
-      const endIndex = extractedBits.indexOf(endMarker, headerIndex + headerBinary.length);
-      if (endIndex === -1) {
-        return null;
-      }
-      
-      // Extract message
-      const messageBinary = extractedBits.substring(headerIndex + headerBinary.length, endIndex);
-      
-      // Convert to text
-      let decodedMessage = '';
-      for (let i = 0; i < messageBinary.length; i += 8) {
-        const byte = messageBinary.substr(i, 8);
-        if (byte.length === 8) {
-          decodedMessage += String.fromCharCode(parseInt(byte, 2));
-        }
-      }
-      
-      // Decrypt if password provided
+
+      // If we get here, try a final decode on all collected stream
+      const decodedAll = decodeRedundantBits(redundantStream);
+      const headerBinary = bytesToBitString(new Uint8Array('USTEGA1'.split('').map(c => c.charCodeAt(0))));
+      const headerIndex = decodedAll.indexOf(headerBinary);
+      if (headerIndex === -1) return null;
+      const lenBits = decodedAll.substr(headerIndex + headerBinary.length, 32);
+      const msgLen = parseInt(lenBits, 2);
+      const totalMsgBits = msgLen * 8;
+      const messageBits = decodedAll.substr(headerIndex + headerBinary.length + 32, totalMsgBits);
+      if (messageBits.length < totalMsgBits) return null;
+      const msgBytes = bitStringToBytes(messageBits);
+      const decodedMessage = new TextDecoder().decode(msgBytes);
       if (password) {
         try {
           const decryptedBytes = CryptoJS.AES.decrypt(decodedMessage, password);
@@ -479,7 +479,6 @@ export class AudioSteganography {
           return null;
         }
       }
-      
       return decodedMessage;
     } catch {
       return null;
@@ -487,309 +486,239 @@ export class AudioSteganography {
   }
 
   private static decodeRedundantBits(redundantBits: string): string {
-    let decoded = '';
-    for (let i = 0; i < redundantBits.length; i += 3) {
-      const triplet = redundantBits.substr(i, 3);
-      if (triplet.length === 3) {
-        // Majority vote
-        const ones = (triplet.match(/1/g) || []).length;
-        decoded += ones >= 2 ? '1' : '0';
-      }
-    }
-    return decoded;
-  }
-
-  static calculateCapacity(file: File): Promise<number> {
-    return this.fileToAudioBuffer(file).then(({ buffer }) => {
-      const samples = this.audioBufferToInt16Array(buffer);
-      const capacity = Math.floor(samples.length * 0.8 / 3); // Account for 3x redundancy
-      return Math.floor(capacity / 8) - 20; // Bytes minus header overhead
-    });
+    return decodeRedundantBits(redundantBits);
   }
 }
 
-// Video Steganography using LSB on frames
+// ---------- VideoSteganography (corrected) ----------
 export class VideoSteganography {
-  private static ffmpeg: FFmpeg | null = null;
+  private static ffmpeg: ReturnType<typeof createFFmpeg> | null = null;
 
-  private static async initFFmpeg(): Promise<FFmpeg> {
+  private static async initFFmpeg(): Promise<ReturnType<typeof createFFmpeg>> {
     if (!this.ffmpeg) {
-      this.ffmpeg = new FFmpeg();
-      
-      const baseURL = 'https://unpkg.com/@ffmpeg/core@0.12.6/dist/umd';
-      await this.ffmpeg.load({
-        coreURL: await toBlobURL(`${baseURL}/ffmpeg-core.js`, 'text/javascript'),
-        wasmURL: await toBlobURL(`${baseURL}/ffmpeg-core.wasm`, 'application/wasm'),
-      });
+      this.ffmpeg = createFFmpeg({ log: false });
+      await this.ffmpeg.load();
     }
     return this.ffmpeg;
   }
 
-  private static seededPRNG(seed: string) {
-    let state = 0;
-    for (let i = 0; i < seed.length; i++) {
-      state = (state * 31 + seed.charCodeAt(i)) >>> 0;
-    }
-    
-    return () => {
-      state = (state * 1664525 + 1013904223) >>> 0;
-      return state / 0x100000000;
-    };
-  }
+  private static seededPRNG = seededPRNG;
 
   private static async videoToFrames(file: File): Promise<{ frames: ImageData[], fps: number, width: number, height: number }> {
     const ffmpeg = await this.initFFmpeg();
     const inputName = `input.${file.name.split('.').pop()}`;
-    
-    await ffmpeg.writeFile(inputName, await fetchFile(file));
-    
-    // Extract frames as PNG images (limit to first 30 seconds for performance)
-    await ffmpeg.exec([
+    await ffmpeg.FS('writeFile', inputName, await fetchFile(file));
+
+    // Extract frames (limit to 30s for performance like your original)
+    await ffmpeg.run(
       '-i', inputName,
       '-t', '30',
-      '-vf', 'scale=640:480,fps=10', // Limit resolution and fps for performance
+      '-vf', 'scale=640:480,fps=10',
       '-f', 'image2',
       'frame_%03d.png'
-    ]);
-    
+    );
+
     const frames: ImageData[] = [];
     let frameIndex = 1;
-    
-    // Read frames until no more exist
     while (true) {
       try {
-        const frameData = await ffmpeg.readFile(`frame_${frameIndex.toString().padStart(3, '0')}.png`) as Uint8Array;
-        
-        // Convert PNG to ImageData
-        const canvas = document.createElement('canvas');
-        const ctx = canvas.getContext('2d')!;
+        const name = `frame_${frameIndex.toString().padStart(3, '0')}.png`;
+        const frameData = ffmpeg.FS('readFile', name) as Uint8Array;
+        const blob = new Blob([frameData.buffer], { type: 'image/png' });
         const img = new Image();
-        
-        await new Promise((resolve, reject) => {
-          img.onload = resolve;
+        await new Promise<void>((resolve, reject) => {
+          img.onload = () => resolve();
           img.onerror = reject;
-          img.src = URL.createObjectURL(new Blob([frameData], { type: 'image/png' }));
+          img.src = URL.createObjectURL(blob);
         });
-        
+        const canvas = document.createElement('canvas');
         canvas.width = img.width;
         canvas.height = img.height;
+        const ctx = canvas.getContext('2d')!;
         ctx.drawImage(img, 0, 0);
-        
         const imageData = ctx.getImageData(0, 0, canvas.width, canvas.height);
         frames.push(imageData);
-        
         URL.revokeObjectURL(img.src);
         frameIndex++;
       } catch {
-        break; // No more frames
+        break;
       }
     }
-    
-    return { frames, fps: 10, width: 640, height: 480 };
+
+    if (frames.length === 0) throw new Error('No frames extracted');
+    return { frames, fps: 10, width: frames[0].width, height: frames[0].height };
   }
 
   private static async framesToVideo(frames: ImageData[], fps: number, width: number, height: number): Promise<Blob> {
     const ffmpeg = await this.initFFmpeg();
-    
-    // Convert frames back to PNG files
+
+    // write frames back
     for (let i = 0; i < frames.length; i++) {
       const canvas = document.createElement('canvas');
       canvas.width = width;
       canvas.height = height;
       const ctx = canvas.getContext('2d')!;
       ctx.putImageData(frames[i], 0, 0);
-      
-      const blob = await new Promise<Blob>((resolve) => {
-        canvas.toBlob((blob) => resolve(blob!), 'image/png');
-      });
-      
-      const frameData = new Uint8Array(await blob.arrayBuffer());
-      await ffmpeg.writeFile(`frame_${i.toString().padStart(3, '0')}.png`, frameData);
+      // canvas.toBlob is async
+      const blob = await new Promise<Blob>((res) => canvas.toBlob(b => res(b!), 'image/png'));
+      const arr = new Uint8Array(await blob.arrayBuffer());
+      await ffmpeg.FS('writeFile', `frame_${i.toString().padStart(3, '0')}.png`, arr);
     }
-    
-    // Encode to lossless WebM
-    await ffmpeg.exec([
-      '-r', fps.toString(),
-      '-i', 'frame_%03d.png',
-      '-c:v', 'libvpx-vp9',
-      '-lossless', '1',
-      '-an', // No audio
-      'output.webm'
-    ]);
-    
-    const videoData = await ffmpeg.readFile('output.webm') as Uint8Array;
-    return new Blob([videoData], { type: 'video/webm' });
+
+    // try to encode with vp9 lossless, fallback if not available
+    try {
+      await ffmpeg.run('-r', String(fps), '-i', 'frame_%03d.png', '-c:v', 'libvpx-vp9', '-lossless', '1', '-an', 'output.webm');
+      const out = ffmpeg.FS('readFile', 'output.webm') as Uint8Array;
+      return new Blob([out.buffer], { type: 'video/webm' });
+    } catch {
+      // fallback to mjpeg (large but widely supported in wasm builds)
+      await ffmpeg.run('-r', String(fps), '-i', 'frame_%03d.png', '-c:v', 'mjpeg', '-q:v', '3', '-an', 'output.avi');
+      const out = ffmpeg.FS('readFile', 'output.avi') as Uint8Array;
+      return new Blob([out.buffer], { type: 'video/avi' });
+    }
   }
 
   static async encode(file: File, secretMessage: string, password?: string, onProgress?: (progress: number) => void): Promise<Blob> {
     if (onProgress) onProgress(10);
-    
     const { frames, fps, width, height } = await this.videoToFrames(file);
-    
     if (onProgress) onProgress(30);
-    
+
     let messageToEncode = secretMessage;
-    
-    // Encrypt if password provided
     if (password) {
+      // keep your CryptoJS-based encryption for minimal changes
       messageToEncode = CryptoJS.AES.encrypt(secretMessage, password).toString();
     }
 
-    // Convert message to binary with header
-    const messageBinary = messageToEncode
-      .split('')
-      .map(char => char.charCodeAt(0).toString(2).padStart(8, '0'))
-      .join('');
-    
+    // Build header & binary (length-prefixed)
     const header = 'VSTEGA1';
-    const headerBinary = header
-      .split('')
-      .map(char => char.charCodeAt(0).toString(2).padStart(8, '0'))
-      .join('');
-    
-    const endMarker = '1111111111111110';
-    const fullBinary = headerBinary + messageBinary + endMarker;
-    
-    // Apply 3x redundancy
-    const redundantBinary = fullBinary.split('').flatMap(bit => [bit, bit, bit]).join('');
-    
-    // Calculate total capacity
+    const headerBinary = bytesToBitString(new Uint8Array(header.split('').map(c => c.charCodeAt(0))));
+    const msgBytes = new TextEncoder().encode(messageToEncode);
+    const lenBinary = msgBytes.length.toString(2).padStart(32, '0');
+    const messageBinary = bytesToBitString(msgBytes);
+    const fullBinary = headerBinary + lenBinary + messageBinary;
+
+    // 3x redundancy
+    const redundantBinary = fullBinary.split('').flatMap(b => [b, b, b]).join('');
+
+    // capacity (we use blue-channel of ~30% pixels across frames)
     const totalPixels = frames.length * width * height;
-    const capacity = Math.floor(totalPixels * 0.3); // Use 30% of blue channel pixels
-    
-    if (redundantBinary.length > capacity) {
+    const embeddingRate = 0.3;
+    const capacityBits = Math.floor(totalPixels * embeddingRate);
+    if (redundantBinary.length > capacityBits) {
       throw new Error('Message too large for this video');
     }
 
     if (onProgress) onProgress(50);
 
-    // Generate PRNG for pixel indices
+    // PRNG seed (use CryptoJS.SHA256 if password given to match your previous code)
     const seed = password ? CryptoJS.SHA256(password).toString() : 'default-seed';
-    const prng = this.seededPRNG(seed);
-    
-    // Embed across all frames
+    // embed across frames, using a frame-specific PRNG to choose pixels
     let bitIndex = 0;
-    
     for (let frameIdx = 0; frameIdx < frames.length && bitIndex < redundantBinary.length; frameIdx++) {
       const frame = frames[frameIdx];
-      const data = frame.data;
-      
-      // Reset PRNG for consistent pattern across frames
-      const framePrng = this.seededPRNG(seed + frameIdx);
-      
-      for (let i = 0; i < data.length && bitIndex < redundantBinary.length; i += 4) {
-        // Use blue channel (index 2) and skip some pixels randomly
-        if (framePrng() < 0.3) { // 30% embedding rate
-          const blueIndex = i + 2;
-          const bit = parseInt(redundantBinary[bitIndex]);
-          data[blueIndex] = (data[blueIndex] & 0xFE) | bit;
-          bitIndex++;
-        }
+      const data = frame.data; // RGBA
+      const pixels = data.length / 4;
+
+      // frame-specific deterministic PRNG
+      const framePrng = seededPRNG(seed + ':' + frameIdx);
+      // estimate available bits this frame will contribute (unique indices)
+      const availableThisFrame = Math.min(Math.ceil(pixels * embeddingRate), redundantBinary.length - bitIndex);
+      const pixelIndices = generateIndicesPRNG(framePrng, pixels, availableThisFrame);
+
+      for (let pi = 0; pi < pixelIndices.length && bitIndex < redundantBinary.length; pi++) {
+        const pixel = pixelIndices[pi];
+        const blueIdx = pixel * 4 + 2;
+        const bit = parseInt(redundantBinary[bitIndex], 10);
+        data[blueIdx] = (data[blueIdx] & 0xFE) | bit;
+        bitIndex++;
       }
     }
 
     if (onProgress) onProgress(80);
 
-    // Convert frames back to video
     const videoBlob = await this.framesToVideo(frames, fps, width, height);
-    
+
     if (onProgress) onProgress(100);
-    
     return videoBlob;
   }
 
   static async decode(file: File, password?: string, onProgress?: (progress: number) => void): Promise<string | null> {
     try {
       if (onProgress) onProgress(10);
-      
       const { frames, width, height } = await this.videoToFrames(file);
-      
       if (onProgress) onProgress(40);
-      
-      // Generate same PRNG sequence
+
+      const embeddingRate = 0.3;
+      const redundancy = 3;
+      const headerBinary = bytesToBitString(new Uint8Array('VSTEGA1'.split('').map(c => c.charCodeAt(0))));
+
       const seed = password ? CryptoJS.SHA256(password).toString() : 'default-seed';
-      
-      // Extract bits from all frames
-      let extractedBits = '';
-      
+
+      // We'll collect a redundant bit stream by iterating frames in same deterministic way
+      let redundantStream = '';
       for (let frameIdx = 0; frameIdx < frames.length; frameIdx++) {
         const frame = frames[frameIdx];
         const data = frame.data;
-        
-        const framePrng = this.seededPRNG(seed + frameIdx);
-        
-        for (let i = 0; i < data.length; i += 4) {
-          if (framePrng() < 0.3) { // Same 30% pattern
-            const blueIndex = i + 2;
-            const bit = data[blueIndex] & 1;
-            extractedBits += bit;
-            
-            // Check if we have enough for header + some data
-            if (extractedBits.length >= 200) {
-              const decoded = this.decodeRedundantBits(extractedBits);
-              if (decoded.includes('VSTEGA1') && decoded.includes('1111111111111110')) {
-                extractedBits = decoded;
-                break;
+        const pixels = data.length / 4;
+        const framePrng = seededPRNG(seed + ':' + frameIdx);
+        const maxThisFrame = Math.ceil(pixels * embeddingRate);
+        const pixelIndices = generateIndicesPRNG(framePrng, pixels, maxThisFrame);
+
+        for (let p = 0; p < pixelIndices.length; p++) {
+          const blueIndex = pixelIndices[p] * 4 + 2;
+          const bit = (data[blueIndex] & 1).toString();
+          redundantStream += bit;
+
+          // Try early decode when we have at least header + length worth of decoded bits (after majority)
+          const minRedundant = (headerBinary.length + 32) * redundancy;
+          if (redundantStream.length >= minRedundant) {
+            const decoded = decodeRedundantBits(redundantStream);
+            const headerIdx = decoded.indexOf(headerBinary);
+            if (headerIdx !== -1 && decoded.length >= headerIdx + headerBinary.length + 32) {
+              const lenBits = decoded.substr(headerIdx + headerBinary.length, 32);
+              const msgLen = parseInt(lenBits, 2);
+              const totalMsgBits = msgLen * 8;
+              if (decoded.length >= headerIdx + headerBinary.length + 32 + totalMsgBits) {
+                const messageBits = decoded.substr(headerIdx + headerBinary.length + 32, totalMsgBits);
+                const msgBytes = bitStringToBytes(messageBits);
+                const decodedMessage = new TextDecoder().decode(msgBytes);
+                if (password) {
+                  try {
+                    const decrypted = CryptoJS.AES.decrypt(decodedMessage, password);
+                    const decryptedMessage = decrypted.toString(CryptoJS.enc.Utf8);
+                    return decryptedMessage || null;
+                  } catch {
+                    return null;
+                  }
+                }
+                return decodedMessage;
               }
             }
           }
         }
-        
-        if (extractedBits.includes('1111111111111110')) break;
+        if (onProgress) onProgress(40 + Math.floor(60 * (frameIdx / frames.length)));
       }
-      
-      if (onProgress) onProgress(70);
-      
-      // Decode redundancy if not already done
-      if (!extractedBits.includes('VSTEGA1')) {
-        extractedBits = this.decodeRedundantBits(extractedBits);
-      }
-      
-      // Find header
-      const headerBinary = 'VSTEGA1'
-        .split('')
-        .map(char => char.charCodeAt(0).toString(2).padStart(8, '0'))
-        .join('');
-      
-      const headerIndex = extractedBits.indexOf(headerBinary);
-      if (headerIndex === -1) {
-        return null;
-      }
-      
-      // Find end marker
-      const endMarker = '1111111111111110';
-      const endIndex = extractedBits.indexOf(endMarker, headerIndex + headerBinary.length);
-      if (endIndex === -1) {
-        return null;
-      }
-      
-      // Extract message
-      const messageBinary = extractedBits.substring(headerIndex + headerBinary.length, endIndex);
-      
-      if (onProgress) onProgress(90);
-      
-      // Convert to text
-      let decodedMessage = '';
-      for (let i = 0; i < messageBinary.length; i += 8) {
-        const byte = messageBinary.substr(i, 8);
-        if (byte.length === 8) {
-          decodedMessage += String.fromCharCode(parseInt(byte, 2));
-        }
-      }
-      
-      // Decrypt if password provided
+
+      // Final attempt after collecting all bits
+      const decodedAll = decodeRedundantBits(redundantStream);
+      const headerIdx = decodedAll.indexOf(headerBinary);
+      if (headerIdx === -1) return null;
+      const lenBits = decodedAll.substr(headerIdx + headerBinary.length, 32);
+      const msgLen = parseInt(lenBits, 2);
+      const totalMsgBits = msgLen * 8;
+      const messageBits = decodedAll.substr(headerIdx + headerBinary.length + 32, totalMsgBits);
+      if (messageBits.length < totalMsgBits) return null;
+      const msgBytes = bitStringToBytes(messageBits);
+      const decodedMessage = new TextDecoder().decode(msgBytes);
       if (password) {
         try {
-          const decryptedBytes = CryptoJS.AES.decrypt(decodedMessage, password);
-          const decryptedMessage = decryptedBytes.toString(CryptoJS.enc.Utf8);
-          if (onProgress) onProgress(100);
+          const decrypted = CryptoJS.AES.decrypt(decodedMessage, password);
+          const decryptedMessage = decrypted.toString(CryptoJS.enc.Utf8);
           return decryptedMessage || null;
         } catch {
           return null;
         }
       }
-      
-      if (onProgress) onProgress(100);
       return decodedMessage;
     } catch {
       return null;
@@ -797,24 +726,20 @@ export class VideoSteganography {
   }
 
   private static decodeRedundantBits(redundantBits: string): string {
-    let decoded = '';
-    for (let i = 0; i < redundantBits.length; i += 3) {
-      const triplet = redundantBits.substr(i, 3);
-      if (triplet.length === 3) {
-        // Majority vote
-        const ones = (triplet.match(/1/g) || []).length;
-        decoded += ones >= 2 ? '1' : '0';
-      }
-    }
-    return decoded;
+    return decodeRedundantBits(redundantBits);
   }
 
   static async calculateCapacity(file: File): Promise<number> {
     try {
       const { frames, width, height } = await this.videoToFrames(file);
       const totalPixels = frames.length * width * height;
-      const capacity = Math.floor(totalPixels * 0.3 / 3); // Account for 3x redundancy
-      return Math.floor(capacity / 8) - 30; // Bytes minus header overhead
+      const embeddingRate = 0.3;
+      const redundancy = 3;
+      const capacityBits = Math.floor(totalPixels * embeddingRate);
+      const payloadBits = Math.floor(capacityBits / redundancy);
+      const payloadBytes = Math.floor(payloadBits / 8);
+      // subtract overhead (7 bytes header + 4 bytes length)
+      return Math.max(0, payloadBytes - (7 + 4));
     } catch {
       return 0;
     }
