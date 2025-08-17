@@ -5,6 +5,8 @@ import { Navigate } from 'react-router-dom';
 import { Tabs, TabsContent, TabsList, TabsTrigger } from '@/components/ui/tabs';
 import { TextSteganographyComponent } from '@/components/steganography/TextSteganography';
 import { ImageSteganographyComponent } from '@/components/steganography/ImageSteganography';
+import { AudioSteganographyComponent } from '@/components/steganography/AudioSteganography';
+import { VideoSteganographyComponent } from '@/components/steganography/VideoSteganography';
 import { FileText, Image, Music, Video } from 'lucide-react';
 
 const MainApp: React.FC = () => {
@@ -68,25 +70,11 @@ const MainApp: React.FC = () => {
           </TabsContent>
 
           <TabsContent value="audio">
-            <div className="text-center py-16">
-              <Music className="h-16 w-16 mx-auto text-muted-foreground mb-4" />
-              <h3 className="text-xl font-semibold mb-2">Audio Steganography</h3>
-              <p className="text-muted-foreground">Coming Soon</p>
-              <p className="text-sm text-muted-foreground mt-2">
-                Hide messages in audio files using advanced frequency domain techniques
-              </p>
-            </div>
+            <AudioSteganographyComponent />
           </TabsContent>
 
           <TabsContent value="video">
-            <div className="text-center py-16">
-              <Video className="h-16 w-16 mx-auto text-muted-foreground mb-4" />
-              <h3 className="text-xl font-semibold mb-2">Video Steganography</h3>
-              <p className="text-muted-foreground">Coming Soon</p>
-              <p className="text-sm text-muted-foreground mt-2">
-                Embed secrets in video frames with temporal redundancy protection
-              </p>
-            </div>
+            <VideoSteganographyComponent />
           </TabsContent>
         </Tabs>
 
