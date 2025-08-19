@@ -44,7 +44,7 @@ export const TextSteganographyComponent: React.FC = () => {
     } catch (error) {
       toast({
         title: "Encoding Failed",
-        description: "Failed to encode the message",
+        description: (error as Error)?.message || "Failed to encode the message",
         variant: "destructive"
       });
     }
@@ -78,7 +78,7 @@ export const TextSteganographyComponent: React.FC = () => {
     } catch (error) {
       toast({
         title: "Decoding Failed",
-        description: "Failed to decode the message",
+        description: (error as Error)?.message || "Failed to decode the message",
         variant: "destructive"
       });
     }
