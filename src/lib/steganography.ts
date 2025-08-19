@@ -409,64 +409,52 @@ export class AudioSteganography {
       const { buffer } = await this.fileToAudioBuffer(file);
       const samples = this.audioBufferToInt16Array(buffer);
       
-      // Generate same PRNG sequence
+      // Generate the same pseudo-random sequence of indices as in encode
       const seed = password ? CryptoJS.SHA256(password).toString() : 'default-seed';
       const prng = this.seededPRNG(seed);
       
-      // Extract bits using same index pattern
-      let extractedBits = '';
+      // Determine the maximum number of bits to extract based on the file's capacity
+      const maxBitsToRead = Math.floor(samples.length * 0.8);
+      
+      // 1. Extract the full stream of redundant bits
+      let redundantBits = '';
       const used = new Set<number>();
-      
-      // Extract more bits than minimum to find the end marker
-      const maxBits = Math.min(10000, Math.floor(samples.length * 0.8));
-      
-      for (let i = 0; i < maxBits; i++) {
+      for (let i = 0; i < maxBitsToRead; i++) {
         let idx;
+        // Find a unique sample index
         do {
           idx = Math.floor(prng() * samples.length);
         } while (used.has(idx));
         used.add(idx);
         
         const bit = samples[idx] & 1;
-        extractedBits += bit;
-        
-        // Check for end marker in the redundant stream
-        if (extractedBits.length >= 48) { // Header + some data minimum
-          const decoded = this.decodeRedundantBits(extractedBits);
-          if (decoded && decoded.includes('1111111111111110')) {
-            extractedBits = decoded;
-            break;
-          }
-        }
+        redundantBits += bit;
       }
       
-      // Decode redundancy (majority vote)
-      if (extractedBits.length < 48) {
-        extractedBits = this.decodeRedundantBits(extractedBits);
-      }
+      // 2. Decode the entire redundant stream to get the normal bitstream
+      const normalBits = this.decodeRedundantBits(redundantBits);
       
-      // Find header
+      // 3. Search for header and end marker in the normal bitstream
       const headerBinary = 'USTEGA1'
         .split('')
         .map(char => char.charCodeAt(0).toString(2).padStart(8, '0'))
         .join('');
       
-      const headerIndex = extractedBits.indexOf(headerBinary);
+      const headerIndex = normalBits.indexOf(headerBinary);
       if (headerIndex === -1) {
-        return null;
+        return null; // Header not found
       }
       
-      // Find end marker
       const endMarker = '1111111111111110';
-      const endIndex = extractedBits.indexOf(endMarker, headerIndex + headerBinary.length);
+      const endIndex = normalBits.indexOf(endMarker, headerIndex + headerBinary.length);
       if (endIndex === -1) {
-        return null;
+        return null; // End marker not found
       }
       
-      // Extract message
-      const messageBinary = extractedBits.substring(headerIndex + headerBinary.length, endIndex);
+      // Extract the message binary
+      const messageBinary = normalBits.substring(headerIndex + headerBinary.length, endIndex);
       
-      // Convert to text
+      // Convert binary to text
       let decodedMessage = '';
       for (let i = 0; i < messageBinary.length; i += 8) {
         const byte = messageBinary.substr(i, 8);
@@ -474,7 +462,7 @@ export class AudioSteganography {
           decodedMessage += String.fromCharCode(parseInt(byte, 2));
         }
       }
-      
+
       // Decrypt if password provided
       if (password) {
         try {
@@ -482,12 +470,13 @@ export class AudioSteganography {
           const decryptedMessage = decryptedBytes.toString(CryptoJS.enc.Utf8);
           return decryptedMessage || null;
         } catch {
-          return null;
+          return null; // Wrong password
         }
       }
-      
+
       return decodedMessage;
-    } catch {
+    } catch (error) {
+      console.error("Audio decoding failed:", error);
       return null;
     }
   }
