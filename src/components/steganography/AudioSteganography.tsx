@@ -104,7 +104,7 @@ export const AudioSteganographyComponent: React.FC = () => {
     } catch (error) {
       toast({
         title: "Encoding failed",
-        description: error instanceof Error ? error.message : "An error occurred during encoding",
+        description: (error as Error)?.message || "An error occurred during encoding",
         variant: "destructive"
       });
     } finally {
@@ -154,7 +154,7 @@ export const AudioSteganographyComponent: React.FC = () => {
     } catch (error) {
       toast({
         title: "Decoding failed",
-        description: error instanceof Error ? error.message : "An error occurred during decoding",
+        description: (error as Error)?.message || "An error occurred during decoding",
         variant: "destructive"
       });
     } finally {
