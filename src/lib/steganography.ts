@@ -26,6 +26,12 @@ export class TextSteganography {
     // Add end marker
     const binaryWithMarker = binaryMessage + '1111111111111110'; // End marker
 
+    // Check if cover text has enough capacity
+    const requiredLength = Math.ceil(binaryWithMarker.length / 2);
+    if (coverText.length < requiredLength) {
+      throw new Error(`Cover text too short. Needs ${requiredLength} characters, but has ${coverText.length}.`);
+    }
+
     let result = '';
     let binaryIndex = 0;
 
